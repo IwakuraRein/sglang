@@ -1074,7 +1074,20 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
             ),
         )
     if method_name == "ModelOptNvFp4A16LinearMethod":
-        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+        if lm_head.weight.dtype != torch.int32:
+            return False
+        if getattr(lm_head, "flashinfer_w4a16_prepared", False):
+            return _has_lm_head_runtime_attrs(
+                lm_head,
+                (
+                    "weight_scale",
+                    "weight_global_scale",
+                    "flashinfer_w4a16_padded_output_size",
+                    "input_size_per_partition",
+                    "output_size_per_partition",
+                ),
+            )
+        return _has_lm_head_runtime_attrs(
             lm_head,
             (
                 "weight_scale",

@@ -289,8 +289,8 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
     </tr>
     <tr>
       <td><code>flashinfer_cutedsl</code></td>
-      <td>SM100</td>
-      <td>FlashInfer CuTe DSL backend</td>
+      <td>SM100; SM120-SM121 for ModelOpt W4A16</td>
+      <td>FlashInfer CuTe DSL backend. Dispatches W4A4 NVFP4 checkpoints to <code>mm_fp4</code> and ModelOpt W4A16 NVFP4 checkpoints to <code>mm_bf16_fp4</code>.</td>
     </tr>
     <tr>
       <td><code>flashinfer_trtllm</code></td>
@@ -306,6 +306,9 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
 </table>
 
 On SM80-SM90, `auto` selects Marlin for NVFP4. NVFP4 GEMM requires FlashInfer to be installed.
+The ModelOpt W4A16 CuTe DSL path requires BF16 activations. When the resolved
+`--fp4-gemm-backend` is `flashinfer_cutedsl` (including `auto` on SM100), W4A16
+checkpoints use `mm_bf16_fp4`; otherwise they use Marlin.
 
 ## Offline Quantization
 

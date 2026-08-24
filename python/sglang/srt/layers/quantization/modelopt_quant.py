@@ -32,8 +32,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
+    apply_w4a16_nvfp4_flashinfer,
     fp4_quantize,
     get_fp4_gemm_runner_backend,
+    prepare_w4a16_nvfp4_for_flashinfer,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -2108,6 +2110,17 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         if hasattr(layer, "input_scale"):
             del layer.input_scale
 
+        if get_fp4_gemm_runner_backend().is_flashinfer_cutedsl():
+            prepare_w4a16_nvfp4_for_flashinfer(
+                layer,
+                weight_name="weight",
+                weight_scale_name="weight_scale",
+                global_scale_name="weight_scale_2",
+                alpha_name="weight_global_scale",
+                group_size=self.quant_config.group_size,
+            )
+            return
+
         if torch.unique(layer.weight_scale_2).numel() != 1:
             logger.warning(
                 "In NVFP4A16 linear, weight_scale_2 differs across fused "
@@ -2134,6 +2147,15 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(layer, "flashinfer_w4a16_prepared", False):
+            return apply_w4a16_nvfp4_flashinfer(
+                layer,
+                x,
+                weight_name="weight",
+                weight_scale_name="weight_scale",
+                alpha_name="weight_global_scale",
+                bias=bias,
+            )
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,

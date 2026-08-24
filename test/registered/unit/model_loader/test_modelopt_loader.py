@@ -962,6 +962,26 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             )
         )
 
+    def test_lm_head_guard_accepts_modelopt_fp4_flashinfer_runtime_state(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(
+            torch.empty(128, 4000, dtype=torch.int32), requires_grad=False
+        )
+        lm_head.weight_scale = nn.Parameter(
+            torch.empty(128, 64000, dtype=torch.uint8), requires_grad=False
+        )
+        lm_head.weight_global_scale = nn.Parameter(torch.empty(1))
+        lm_head.flashinfer_w4a16_prepared = True
+        lm_head.flashinfer_w4a16_padded_output_size = 128000
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128000
+
+        self.assertTrue(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
+            )
+        )
+
     def test_lm_head_guard_rejects_stale_modelopt_fp4_method_on_dense_head(self):
         lm_head = nn.Module()
         lm_head.weight = nn.Parameter(torch.empty(128000, 2048))
