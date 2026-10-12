@@ -1,7 +1,9 @@
 """FlashInfer KDA prefill integration against SGLang's Triton reference."""
 
+from importlib.util import find_spec
 from itertools import accumulate
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -151,13 +153,16 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
             )
         if kernel is fi and track:
             kwargs.update(vars(metadata))
-        output = kernel.extend(
-            *inputs,
-            ssm_states=state,
-            cache_indices=slots[: len(run_lengths)],
-            query_start_loc=offsets,
-            **kwargs,
-        )
+        with patch.object(fi, "_recurrent_kda", wraps=fi._recurrent_kda) as recurrent:
+            output = kernel.extend(
+                *inputs,
+                ssm_states=state,
+                cache_indices=slots[: len(run_lengths)],
+                query_start_loc=offsets,
+                **kwargs,
+            )
+            if kernel is fi and track:
+                assert recurrent.call_args.kwargs["backend"] == "cute-dsl"
         assert torch.isfinite(output[0] if track else output).all()
         assert torch.isfinite(state).all()
         return state, snapshots
@@ -175,7 +180,9 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
         )
 
     boundary = 512 if prefix_len else 128
-    prefix_state, _ = run(fi, prefix_tokens=boundary)
+    # Compare checkpoint and prefix state from the same arithmetic pipeline.
+    with patch.object(fi, "_has_small_bh", False):
+        prefix_state, _ = run(fi, prefix_tokens=boundary)
     if prefix_len:
         assert (
             torch.linalg.vector_norm(fi_track[0] - prefix_state[1])
@@ -186,6 +193,125 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
         torch.testing.assert_close(fi_track[0], triton_prefix[1], atol=1e-5, rtol=5e-2)
     else:
         torch.testing.assert_close(fi_track[0], prefix_state[1].float(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("case", ["small_bh", "fp32", "large_bh", "padded_row"])
+def test_kda_prefill_pooled_continuation(case):
+    """Dense small-BH states must scatter back to the right pool slots.
+
+    Continuing a second packed extend also detects dropped initial states;
+    unsupported pool dtypes, large logical batches, and padded rows retain the
+    indexed backend even when no intermediate checkpoints are requested.
+    """
+    if case == "small_bh" and find_spec("flashinfer.kda_prefill_cute_small_bh") is None:
+        pytest.skip("The installed FlashInfer predates its small-BH KDA backend")
+    torch.manual_seed(19)
+    heads, dim = 2, 128
+    sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
+    lengths = [65, 129]
+    if case == "large_bh":
+        lengths = [5] * (sm_count // (2 * heads) + 1)
+    elif case == "padded_row":
+        lengths.append(0)
+    batch_size = len(lengths)
+    # The physical state pool is deliberately too large for small-BH; dispatch
+    # must count packed logical sequences rather than pool capacity or q.shape[0].
+    num_slots = max(batch_size + 3, sm_count // (2 * heads) + 3)
+    dtype = torch.float32 if case == "fp32" else torch.bfloat16
+    initial = (torch.randn(num_slots, heads, dim, dim, device="cuda") * 0.1).to(dtype)
+    state = torch.empty_strided(
+        initial.shape,
+        (heads * dim * dim + 16, dim * dim, dim, 1),
+        device="cuda",
+        dtype=dtype,
+    )
+    state.copy_(initial)
+    reference_state = initial.clone()
+    slots = torch.arange(batch_size, 0, -1, device="cuda", dtype=torch.int32)
+    untouched = torch.ones(num_slots, device="cuda", dtype=torch.bool)
+    untouched[slots[: sum(n > 0 for n in lengths)].long()] = False
+    state_ptr = state.data_ptr()
+    fi, triton = FlashInferKDAPrefillKernel(), TritonKDAKernel()
+    gates = dict(
+        A_log=torch.randn(heads, device="cuda") * 0.1,
+        dt_bias=torch.randn(heads, dim, device="cuda") * 0.1,
+        lower_bound=-5.0,
+        beta_is_raw=True,
+    )
+    expected_backend = "small-bh" if case == "small_bh" else "cute-dsl"
+
+    for step in range(2):
+        run_lengths = lengths if step == 0 else [min(n, 67) for n in lengths]
+        total_tokens = sum(run_lengths)
+        offsets = torch.tensor(
+            [0, *accumulate(run_lengths)], device="cuda", dtype=torch.int32
+        )
+        inputs = [
+            torch.randn(
+                1, total_tokens, heads, dim, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.5
+            for _ in range(3)
+        ]
+        # Retaining gates make continuation depend on the previous final state.
+        inputs.extend(
+            [
+                torch.randn(
+                    1, total_tokens, heads, dim, device="cuda", dtype=torch.bfloat16
+                )
+                * 0.3
+                - 3.0,
+                torch.randn(
+                    1, total_tokens, heads, device="cuda", dtype=torch.bfloat16
+                ),
+            ]
+        )
+        kwargs = dict(
+            gates,
+            cache_indices=slots,
+            query_start_loc=offsets,
+            extend_seq_lens_cpu=run_lengths,
+        )
+        reference = triton.extend(
+            *(x.clone() for x in inputs), ssm_states=reference_state, **kwargs
+        )
+        tracking = {}
+        if step == 1:
+            # Tracking may be enabled with no unaligned boundary to snapshot.
+            # That must not disable small-BH or modify any tracking destination.
+            snapshots = torch.full_like(
+                initial[:batch_size], torch.nan, dtype=torch.float32
+            )
+            starts = list(accumulate((n // 64 for n in run_lengths), initial=0))
+            tracking = dict(
+                return_intermediate_states=True,
+                track_state=snapshots,
+                track_ssm_h_batch_src=slots[:0],
+                num_state_checkpoints=0,
+                state_checkpoint_cu_starts=torch.tensor(
+                    starts, device="cuda", dtype=torch.int64
+                ),
+                state_checkpoint_indices=torch.full(
+                    (starts[-1],), -1, device="cuda", dtype=torch.int32
+                ),
+                state_checkpoint_every_n_tokens=64,
+            )
+        with patch.object(fi, "_recurrent_kda", wraps=fi._recurrent_kda) as recurrent:
+            actual = fi.extend(
+                *(x.clone() for x in inputs),
+                ssm_states=state,
+                **kwargs,
+                **tracking,
+            )
+            assert recurrent.call_args.kwargs["backend"] == expected_backend
+        if step == 1:
+            actual, intermediate = actual
+            assert intermediate is None
+            assert torch.isnan(snapshots).all()
+        torch.testing.assert_close(actual, reference, atol=5e-4, rtol=3e-2)
+        torch.testing.assert_close(state, reference_state, atol=5e-3, rtol=3e-2)
+        assert state.data_ptr() == state_ptr
+        torch.testing.assert_close(state[untouched], initial[untouched], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(

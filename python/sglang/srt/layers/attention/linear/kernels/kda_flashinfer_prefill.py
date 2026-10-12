@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from importlib.util import find_spec
 from itertools import accumulate
 from typing import TYPE_CHECKING, Optional
 
@@ -80,6 +82,13 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         from flashinfer.kda import recurrent_kda
 
         self._recurrent_kda = recurrent_kda
+        # FlashInfer 0.7.0 has the pooled kernel but predates the small-BH backend.
+        self._has_small_bh = (
+            find_spec("flashinfer.kda_prefill_cute_small_bh") is not None
+        )
+        self._sm_count = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
 
     def decode(self, *args, **kwargs):
         raise NotImplementedError("FlashInferKDAPrefillKernel is prefill-only")
@@ -107,7 +116,39 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         needs_checkpoint = (
-            return_intermediate_states and kwargs.get("track_state") is not None
+            return_intermediate_states
+            and kwargs.get("track_state") is not None
+            and num_state_checkpoints > 0
+        )
+        q, k, v = (tensor.contiguous() for tensor in (q, k, v))
+        g = g[:, : q.shape[1]].contiguous()
+        beta = beta[:, : q.shape[1]].contiguous()
+        extend_lens = kwargs.get("extend_seq_lens_cpu")
+        num_sequences = query_start_loc.numel() - 1
+        # FlashInfer's small-BH CuTe DSL kernel needs dense BF16 state and
+        # cannot write radix-cache checkpoints. Match its occupancy heuristic
+        # before paying for the pool gather/scatter; padded batches stay pooled.
+        use_small_bh = (
+            self._has_small_bh
+            and not needs_checkpoint
+            and not kwargs.get("is_spec_decode", False)
+            and ssm_states.dtype == torch.bfloat16
+            and all(tensor.dtype == torch.bfloat16 for tensor in (q, k, v, g, beta))
+            and q.shape == k.shape == v.shape == g.shape
+            and q.shape[-1] == 128
+            and q.shape[1] > 1
+            and lower_bound is not None
+            and math.isfinite(lower_bound)
+            and lower_bound < 0
+            and extend_lens is not None
+            and len(extend_lens) == num_sequences
+            and all(length > 0 for length in extend_lens)
+            and 2 * num_sequences * q.shape[2] <= self._sm_count
+        )
+        # PyTorch's index_copy_ requires int64; FlashInfer's pool API uses int32.
+        state_indices = cache_indices.to(torch.int64 if use_small_bh else torch.int32)
+        initial_state = (
+            ssm_states.index_select(0, state_indices) if use_small_bh else ssm_states
         )
         checkpoints = (
             ssm_states.new_empty((num_state_checkpoints, *ssm_states.shape[1:]))
@@ -115,20 +156,20 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             else None
         )
         result = self._recurrent_kda(
-            q=q.contiguous(),
-            k=k.contiguous(),
-            v=v.contiguous(),
-            g=g[:, : q.shape[1]].contiguous(),
-            beta=beta[:, : q.shape[1]].contiguous(),
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
             A_log=A_log.reshape(-1).float().contiguous(),
             dt_bias=dt_bias.reshape(q.shape[2], 128).float().contiguous(),
-            initial_state=ssm_states,
+            initial_state=initial_state,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             lower_bound=lower_bound,
             cu_seqlens=query_start_loc,
-            ssm_state_indices=cache_indices.to(torch.int32),
+            ssm_state_indices=None if use_small_bh else state_indices,
             beta_is_logit=True,
             state_checkpoints=checkpoints,
             checkpoint_cu_starts=(
@@ -140,8 +181,10 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             checkpoint_every_n_tokens=(
                 state_checkpoint_every_n_tokens if needs_checkpoint else 0
             ),
-            backend="cute-dsl",
+            backend="small-bh" if use_small_bh else "cute-dsl",
         )
+        if use_small_bh:
+            ssm_states.index_copy_(0, state_indices, initial_state)
         if needs_checkpoint:
             kwargs["track_state"][track_ssm_h_batch_src] = checkpoints.float()
         output = result[0]
