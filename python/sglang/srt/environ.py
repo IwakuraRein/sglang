@@ -1931,6 +1931,10 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Run decode routed experts (<= 64 tokens, SM100/SM103, TP8/TP16) on the CuTe
+    # DSL persistent kernel ported from vLLM instead of trtllm-gen. See
+    # srt/layers/moe/kimi_k3_persistent_experts.py.
+    SGLANG_ENABLE_K3_PERSISTENT_EXPERTS = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

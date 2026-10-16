@@ -304,3 +304,18 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="moe.kimi_k3_persistent_experts",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.moe.kimi_k3.experts_runtime:PersistentExperts",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+        description=(
+            "Kimi K3 decode routed experts (896 experts, top-16, latent 3584, "
+            "MXFP4 trtllm-gen weights x MXFP8 activations, SiTU) as one "
+            "persistent CuTe DSL kernel for <= 64 tokens; ported from vLLM."
+        ),
+    )
+)

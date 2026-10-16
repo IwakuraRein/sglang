@@ -75,7 +75,7 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.layers.moe import kimi_k3_persistent_experts, route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
@@ -581,6 +581,15 @@ class KimiK3MoE(nn.Module):
             get_moe_runner_backend().is_flashinfer_mxfp4()
             and config.hidden_act == "situ"
         )
+        # Decode routed experts on the CuTe persistent kernel; built after weight
+        # loading by _prepare_persistent_experts().
+        self._persistent_experts: Optional[
+            kimi_k3_persistent_experts.KimiK3PersistentExperts
+        ] = None
+        self._situ_betas = (
+            config.activation_situ_beta,
+            config.activation_situ_linear_beta,
+        )
 
         # Shared experts operate on original hidden states. EP a2a gives each
         # rank a token shard: either replicate the weights, or gather within
@@ -702,6 +711,42 @@ class KimiK3MoE(nn.Module):
             )
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
+        )
+
+    def _prepare_persistent_experts(self) -> None:
+        """Build the CuTe persistent decode experts over the loaded trtllm-gen
+        weights; runs after process_weights_after_loading, before graph capture."""
+        if not (
+            envs.SGLANG_ENABLE_K3_PERSISTENT_EXPERTS.get()
+            and self._defer_moe_finalize
+            and self.use_latent_moe
+            # MXFP4 on the trtllm-gen runner only: the kernel reads that weight
+            # layout and its E8M0 1x32 scales (NVFP4 has FP8 1x16 scales).
+            and self._route_quant_fuse_eligible
+        ):
+            return
+        experts = self.experts
+        if not kimi_k3_persistent_experts.is_supported(
+            w13=experts.w13_weight,
+            w13_scale=experts.w13_weight_scale,
+            w2=experts.w2_weight,
+            w2_scale=experts.w2_weight_scale,
+            num_local_experts=experts.num_local_experts,
+            top_k=self.topk.topk_config.top_k,
+            situ_betas=self._situ_betas,
+        ):
+            rank0_log(
+                "K3 persistent experts disabled: unsupported expert weights "
+                f"{tuple(experts.w13_weight.shape)} {experts.w13_weight.dtype}"
+            )
+            return
+        self._persistent_experts = kimi_k3_persistent_experts.KimiK3PersistentExperts(
+            w13=experts.w13_weight,
+            w13_scale=experts.w13_weight_scale,
+            w2=experts.w2_weight,
+            w2_scale=experts.w2_weight_scale,
+            beta=self._situ_betas[0],
+            linear_beta=self._situ_betas[1],
         )
 
     def _merge_front_weights(self) -> None:
@@ -1314,6 +1359,13 @@ class KimiK3MoE(nn.Module):
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
+        persistent = self._persistent_experts
+        if persistent is not None and persistent.ready(routed_input.shape[0]):
+            # The persistent kernel quantizes routed_input itself: no staged quant.
+            topk_output = self.topk(hidden_states, router_logits)
+            return persistent.forward_deferred(
+                routed_input, topk_output.topk_ids, topk_output.topk_weights
+            )
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
@@ -3388,11 +3440,15 @@ class KimiK3LinearForCausalLM(nn.Module):
 
         # Post-load: merge the horizontally-fused decode weights (views of the
         # merged buffers, ~0 extra memory); must run before cuda graph capture.
+        num_persistent_experts = 0
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
+                layer.mlp._prepare_persistent_experts()
+                if layer.mlp._persistent_experts is not None:
+                    num_persistent_experts += 1
                 # Convert the correction bias to fp32 once so the per-call
                 # .to(float32) in topk is a no-op, not one upcast kernel per
                 # MoE layer per step.
@@ -3402,6 +3458,10 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+        if num_persistent_experts:
+            rank0_log(
+                f"K3 persistent experts enabled on {num_persistent_experts} MoE layers."
+            )
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
