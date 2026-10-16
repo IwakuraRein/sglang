@@ -24,11 +24,6 @@ _MAX_TOKENS = 64
 # (w13 rows, w2 row bytes) per rank: TP8 I=384, TP16 I=256 (padded).
 _SUPPORTED_SHAPES = {(768, 192), (512, 128)}
 
-# Workspace, plan and output rows are shared by every MoE layer of the model: the
-# layers run in order on one stream and each output is consumed by its own finalize.
-_SHARED: dict[torch.device, dict[str, torch.Tensor]] = {}
-
-
 def is_supported(
     *,
     w13: torch.Tensor,
@@ -60,20 +55,27 @@ def is_supported(
     )
 
 
-def _shared_buffers(tp: int, device: torch.device) -> dict[str, torch.Tensor]:
-    from sglang.kernels.ops.moe.kimi_k3.experts_runtime import scratch
+class KimiK3PersistentExpertsBuffers:
+    """Workspace, plan and output rows shared by every MoE layer of one model: the
+    layers run in order on one stream and each output is consumed by its own
+    finalize before the next layer's experts write it."""
 
-    buffers = _SHARED.get(device)
-    if buffers is None:
-        buffers = dict(scratch(tp, device))
-        buffers["out"] = torch.empty(
-            _MAX_TOKENS, _TOP_K, _LATENT, dtype=torch.bfloat16, device=device
-        )
-        buffers["identity"] = torch.arange(
-            _MAX_TOKENS * _TOP_K, dtype=torch.int32, device=device
-        )
-        _SHARED[device] = buffers
-    return buffers
+    def __init__(self):
+        self._buffers: Optional[dict[str, torch.Tensor]] = None
+
+    def get(self, *, tp: int, device: torch.device) -> dict[str, torch.Tensor]:
+        if self._buffers is None:
+            from sglang.kernels.ops.moe.kimi_k3.experts_runtime import scratch
+
+            buffers = dict(scratch(tp, device))
+            buffers["out"] = torch.empty(
+                _MAX_TOKENS, _TOP_K, _LATENT, dtype=torch.bfloat16, device=device
+            )
+            buffers["identity"] = torch.arange(
+                _MAX_TOKENS * _TOP_K, dtype=torch.int32, device=device
+            )
+            self._buffers = buffers
+        return self._buffers
 
 
 class KimiK3PersistentExperts:
@@ -88,6 +90,7 @@ class KimiK3PersistentExperts:
         w2_scale: torch.Tensor,
         beta: float,
         linear_beta: float,
+        buffers: KimiK3PersistentExpertsBuffers,
     ):
         from sglang.kernels.ops.moe.kimi_k3.experts_runtime import PersistentExperts
 
@@ -99,7 +102,7 @@ class KimiK3PersistentExperts:
             beta=beta,
             linear_beta=linear_beta,
         )
-        self._buffers = _shared_buffers(self._experts.tp, w13.device)
+        self._buffers = buffers.get(tp=self._experts.tp, device=w13.device)
         self._prepared: set[int] = set()
 
     def ready(self, num_tokens: int) -> bool:
