@@ -165,6 +165,16 @@ def _quantize_fp8_qkv(q, k, v, layer):
 global_cute_dsl_workspace_buffer = None
 
 
+def _cute_dsl_workspace_buffer(size: int, device) -> torch.Tensor:
+    """The workspace shared by every cute-dsl MLA kernel call of this process."""
+    global global_cute_dsl_workspace_buffer
+    if global_cute_dsl_workspace_buffer is None:
+        global_cute_dsl_workspace_buffer = torch.zeros(
+            size, dtype=torch.int8, device=device
+        )
+    return global_cute_dsl_workspace_buffer
+
+
 @dataclass
 class TRTLLMMLAPrefillMetadata:
     """Metadata for TRTLLM MLA prefill operations."""
@@ -256,17 +266,22 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        # The kernel run for multi-token queries (target verify, draft extend);
+        # single-token decode keeps self.backend.
+        self.verify_backend = (
+            envs.SGLANG_TRTLLM_MLA_VERIFY_BACKEND.get()
+            if self.backend == "trtllm-gen"
+            else self.backend
+        )
+        if self.verify_backend not in ("trtllm-gen", "cute-dsl"):
+            raise ValueError(
+                "SGLANG_TRTLLM_MLA_VERIFY_BACKEND must be 'trtllm-gen' or "
+                f"'cute-dsl', got {self.verify_backend!r}"
+            )
         if self.backend == "cute-dsl":
-            # Separate buffer from trtllm-gen (see note above); safe to share
-            # among cute-dsl instances.
-            global global_cute_dsl_workspace_buffer
-            if global_cute_dsl_workspace_buffer is None:
-                global_cute_dsl_workspace_buffer = torch.zeros(
-                    self.workspace_size,
-                    dtype=torch.int8,
-                    device=model_runner.device,
-                )
-            self.workspace_buffer = global_cute_dsl_workspace_buffer
+            self.workspace_buffer = _cute_dsl_workspace_buffer(
+                self.workspace_size, model_runner.device
+            )
         else:
             self.workspace_buffer = get_buffer(
                 "trtllm_mla_zero_workspace",
@@ -276,6 +291,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     device=model_runner.device,
                 ),
             )
+
+        self.verify_workspace_buffer = (
+            _cute_dsl_workspace_buffer(self.workspace_size, model_runner.device)
+            if self.verify_backend == "cute-dsl"
+            else self.workspace_buffer
+        )
 
         self._multi_ctas_kv_counter_buffer = (
             make_persistent_multi_ctas_kv_counter_buffer(
@@ -1033,8 +1054,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
-        extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
-        if self.backend == "trtllm-gen":
+        backend, workspace_buffer = (
+            (self.verify_backend, self.verify_workspace_buffer)
+            if q_len > 1
+            else (self.backend, self.workspace_buffer)
+        )
+        extra_kwargs = {"backend": backend} if backend != "trtllm-gen" else {}
+        if backend == "trtllm-gen":
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
                 self._multi_ctas_kv_counter_buffer
             )
@@ -1042,7 +1068,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             query=query,
             kv_cache=kv_cache,
             enable_pdl=_ENABLE_PDL,
-            workspace_buffer=self.workspace_buffer,
+            workspace_buffer=workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,

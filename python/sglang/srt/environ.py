@@ -1154,6 +1154,11 @@ class Envs:
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    # FlashInfer MLA kernel trtllm_mla runs for multi-token queries (target verify,
+    # draft extend), "trtllm-gen" or "cute-dsl"; single-token decode stays on
+    # trtllm-gen. Measured on B300 (12 heads, q_len 4, 8K context, bf16 KV):
+    # trtllm-gen 288 us, cute-dsl 115 us; at q_len 1 trtllm-gen 89, cute-dsl 105.
+    SGLANG_TRTLLM_MLA_VERIFY_BACKEND = EnvStr("trtllm-gen")
     # Split TRTLLM-GEN decode attention into sorted, equal-size request groups.
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
