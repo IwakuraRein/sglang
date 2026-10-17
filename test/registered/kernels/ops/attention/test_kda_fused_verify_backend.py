@@ -9,17 +9,21 @@ import torch
 from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
     fused_kda_conv_gating_verify,
 )
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    scatter_mamba_states_after_mtp_verify,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     KDAKernelDispatcher,
+    _dspark_cutedsl_available,
 )
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import override_platform
+from sglang.srt.runtime_context import get_context, override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -104,7 +108,9 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         ]
         return layers, state, slots, batch, rounds
 
-    def _make_backend(self, template, slots, steps, *, fused, ring=True):
+    def _make_backend(
+        self, template, slots, steps, *, fused, ring=True, scratch_rows=None
+    ):
         state = MambaPool.SpeculativeState(
             conv=[template.conv[0].clone()],
             temporal=template.temporal.clone(),
@@ -114,7 +120,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 if ring
                 else template.temporal.new_zeros(
                     template.temporal.shape[0],
-                    slots.numel(),
+                    scratch_rows or slots.numel(),
                     steps,
                     *template.temporal.shape[2:],
                 )
@@ -318,6 +324,145 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 self.assertEqual(backend._fused_chain_verify_fn.call_count, 2)
                 for actual, expected in zip(out, ref):
                     torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
+
+    @unittest.skipUnless(_dspark_cutedsl_available(), "nv_cutedsl verify needs SM10x")
+    def test_nv_cutedsl_fused_accept_matches_commit_scatter(self):
+        """nv_cutedsl with fused accept (seed from last round's accepted
+        snapshot, conv-only commit) must match the SSM commit scatter path."""
+        steps, batch_size = 4, 3
+        layers, initial, slots, batch, _ = self._make_case(
+            batch_size=batch_size, heads=2, v_heads=2
+        )
+        for layer in layers:
+            # The Kimi-K3 CuTe verify contract: no conv bias, fp32 conv taps.
+            layer.bias = None
+            layer.conv_weights = layer.conv_weights.float()
+        num_slots = initial.temporal.shape[1]
+        arms = {}
+        for fused_accept in (False, True):
+            # Fused accept keys the scratch rows by mamba slot.
+            backend, hybrid, state = self._make_backend(
+                initial,
+                slots,
+                steps,
+                fused=False,
+                ring=False,
+                scratch_rows=num_slots if fused_accept else None,
+            )
+            backend.kernel_dispatcher = KDAKernelDispatcher(
+                LinearAttnKernelBackend.TRITON,
+                LinearAttnKernelBackend.TRITON,
+                LinearAttnKernelBackend.NV_CUTEDSL,
+            )
+            if fused_accept:
+                # Extend staging: the committed state at step 0, accept length 1.
+                state.intermediate_ssm[:, slots.long(), 0] = state.temporal[
+                    :, slots.long()
+                ]
+                backend.accept_lens_pool = torch.ones(
+                    num_slots, device="cuda", dtype=torch.int32
+                )
+            arms[fused_accept] = (backend, hybrid, state)
+
+        gen = torch.Generator(device="cuda").manual_seed(7)
+        dim = layers[0].conv_weights.shape[0]
+        v_dim = layers[0].v_dim
+        for round_idx in range(3):
+            inputs = [
+                tuple(
+                    (torch.randn(*shape, device="cuda", generator=gen) * 0.2).to(
+                        torch.bfloat16
+                    )
+                    for shape in (
+                        (batch_size * steps, dim),
+                        (1, batch_size * steps, v_dim),
+                        (1, batch_size * steps, layers[0].num_v_heads),
+                    )
+                )
+                for _ in layers
+            ]
+            last_steps = torch.randint(
+                0, steps, (batch_size,), device="cuda", generator=gen
+            )
+            outs = {}
+            for fused_accept, (backend, hybrid, state) in arms.items():
+                outs[fused_accept] = self._verify(backend, layers, batch, inputs)
+                if fused_accept:
+                    hybrid.update_mamba_state_after_mtp_verify(
+                        last_correct_step_indices=last_steps,
+                        mamba_track_indices=None,
+                        mamba_steps_to_track=None,
+                        model=None,
+                    )
+                else:
+                    scatter_mamba_states_after_mtp_verify(
+                        state, slots, last_steps, None, None
+                    )
+            for actual, expected in zip(outs[True], outs[False]):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            _, _, fused_state = arms[True]
+            _, _, ref_state = arms[False]
+            accept = arms[True][0].accept_lens_pool[slots.long()].long()
+            torch.testing.assert_close(
+                fused_state.intermediate_ssm[:, slots.long(), accept - 1],
+                ref_state.temporal[:, slots.long()],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                fused_state.conv[0], ref_state.conv[0], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                fused_state.temporal, initial.temporal, rtol=0, atol=0
+            )
+
+    @unittest.skipUnless(_dspark_cutedsl_available(), "nv_cutedsl verify needs SM10x")
+    def test_nv_cutedsl_fused_accept_gate(self):
+        """nv_cutedsl takes fused accept only where every verify runs the CuTe
+        kernel: its Triton fallback (tree verify, draft windows past 8) cannot
+        seed from the accepted snapshot."""
+        chain = dict(
+            speculative_algorithm="EAGLE3",
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            disable_radix_cache=True,
+        )
+        for overrides, expected in (
+            ({}, True),
+            ({"speculative_eagle_topk": 4}, False),
+            ({"speculative_num_draft_tokens": 16}, False),
+        ):
+            with (
+                self.subTest(**overrides),
+                get_context().override_server_args(**{**chain, **overrides}),
+            ):
+                self.assertEqual(
+                    KDAAttnBackend._can_fuse_accept_state(
+                        LinearAttnKernelBackend.NV_CUTEDSL
+                    ),
+                    expected,
+                )
+
+    @unittest.skipUnless(_dspark_cutedsl_available(), "nv_cutedsl verify needs SM10x")
+    def test_nv_cutedsl_fused_accept_refuses_triton_fallback(self):
+        """Under fused accept, a layer outside the CuTe contract (here a conv
+        bias) must fail loudly: the Triton fallback would seed from the stale
+        committed pool."""
+        layers, initial, slots, batch, rounds = self._make_case(heads=2, v_heads=2)
+        num_slots = initial.temporal.shape[1]
+        backend, _, _ = self._make_backend(
+            initial, slots, 4, fused=False, ring=False, scratch_rows=num_slots
+        )
+        backend.kernel_dispatcher = KDAKernelDispatcher(
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.NV_CUTEDSL,
+        )
+        backend.accept_lens_pool = torch.ones(
+            num_slots, device="cuda", dtype=torch.int32
+        )
+        with self.assertRaisesRegex(RuntimeError, "fused-accept"):
+            self._verify(backend, layers, batch, rounds[0])
 
 
 if __name__ == "__main__":

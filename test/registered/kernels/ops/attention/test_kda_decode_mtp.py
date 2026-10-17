@@ -261,6 +261,129 @@ class TestKdaDecodeMtp(CustomTestCase):
                     streaming[1], resident[1], atol=1e-4, rtol=1e-4
                 )
 
+    def test_verify_tuned_config_matches_resident_default(self):
+        # The verify-tuned state stages / lane split re-tile the same resident
+        # recurrence, so they must agree with the default within 1 bf16 ulp.
+        num_requests, num_spec, num_heads = 16, 3, 12
+        config = (
+            kda_decode_mtp.BLOCK_THREADS_NARROW,
+            kda_decode_mtp.NUM_STATE_STAGES_VERIFY,
+            kda_decode_mtp.P2_LANES_VERIFY,
+        )
+        default = (
+            kda_decode_mtp.BLOCK_THREADS_NARROW,
+            kda_decode_mtp.NUM_STATE_STAGES,
+            kda_decode_mtp.P2_LANES_RESIDENT,
+        )
+        results = []
+        for launch in (config, default):
+            kwargs = _make_inputs(num_requests, num_spec, num_heads=num_heads)
+            intermediate = torch.zeros(
+                num_requests, 1 + num_spec, num_heads, 128, 128, device="cuda"
+            )
+            with mock.patch.object(
+                kda_decode_mtp, "_launch_config", lambda launch=launch, **_: launch
+            ):
+                output = fused_kda_decode_mtp_dspark(
+                    intermediate_ssm=intermediate, **kwargs
+                )
+            results.append((output, intermediate))
+        torch.testing.assert_close(results[0][0], results[1][0], atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(results[0][1], results[1][1], atol=1e-4, rtol=1e-4)
+
+    def test_fused_accept_matches_commit_scatter(self):
+        """Seeding verify from last round's accepted snapshot must reproduce the
+        commit-scatter path: same outputs and committed state every round,
+        including requests re-extended mid-run and a CUDA-graph padding row."""
+        for num_heads, num_requests in ((2, 6), (12, 16)):
+            with self.subTest(num_heads=num_heads, num_requests=num_requests):
+                self._check_fused_accept(num_heads, num_requests, num_spec=3)
+
+    def _check_fused_accept(self, num_heads, num_requests, *, num_spec, rounds=5):
+        steps = 1 + num_spec
+        gen = torch.Generator(device="cuda").manual_seed(11)
+        base = _make_inputs(num_requests, num_spec, num_heads=num_heads)
+        num_slots = num_requests + 3
+        # Shuffled slots, padding row last.
+        slots = torch.randperm(num_slots - 1, device="cuda", generator=gen)[
+            :num_requests
+        ].to(torch.int32)
+        slots[-1] = -1
+        live = slots >= 0
+        live_slots = slots[live].long()
+        rows = torch.arange(num_requests, device="cuda")[live]
+        state_shape = (num_heads, 128, 128)
+        pool = torch.randn(num_slots, *state_shape, device="cuda", generator=gen)
+        conv = [c.clone() for c in (base["cs_q"], base["cs_k"], base["cs_v"])]
+        scatter = dict(
+            pool=pool.clone(),
+            conv=[c.clone() for c in conv],
+            inter=torch.zeros(num_requests, steps, *state_shape, device="cuda"),
+        )
+        fused = dict(
+            pool=pool.clone(),
+            conv=[c.clone() for c in conv],
+            inter=torch.zeros(num_slots, steps, *state_shape, device="cuda"),
+            accept=torch.ones(num_slots, device="cuda", dtype=torch.int32),
+        )
+        # Extend staging: every request starts from its committed state.
+        fused["inter"][live_slots, 0] = fused["pool"][live_slots]
+
+        def run(path, inputs):
+            ic = [torch.zeros_like(base["intermediate_conv_q"]) for _ in range(3)]
+            kwargs = dict(base, **inputs)
+            kwargs.update(
+                cs_q=path["conv"][0],
+                cs_k=path["conv"][1],
+                cs_v=path["conv"][2],
+                recurrent_state=path["pool"],
+                intermediate_ssm=path["inter"],
+                intermediate_conv_q=ic[0],
+                intermediate_conv_k=ic[1],
+                intermediate_conv_v=ic[2],
+                ssm_state_indices=slots,
+            )
+            if "accept" in path:
+                kwargs["accept_lens_pool"] = path["accept"]
+            return fused_kda_decode_mtp_dspark(**kwargs), ic
+
+        for round_idx in range(rounds):
+            inputs = {
+                name: torch.randn(base[name].shape, device="cuda", generator=gen).to(
+                    base[name].dtype
+                )
+                for name in ("x_q", "x_k", "x_v", "g", "beta")
+            }
+            if round_idx in (2, 3):
+                # Re-extend one request: a fresh committed state and conv window.
+                fresh = live_slots[round_idx % live_slots.numel()]
+                new_state = torch.randn(state_shape, device="cuda", generator=gen)
+                for pool_copy in (scatter["pool"], fused["pool"], pool):
+                    pool_copy[fresh] = new_state
+                fused["inter"][fresh, 0] = new_state
+                fused["accept"][fresh] = 1
+            out_s, ic_s = run(scatter, inputs)
+            out_f, ic_f = run(fused, inputs)
+            self.assertTrue(torch.equal(out_f, out_s), f"round {round_idx} output")
+            accept = torch.randint(
+                1, steps + 1, (rows.numel(),), device="cuda", generator=gen
+            )
+            # Scatter commit: SSM and conv windows into the pool.
+            scatter["pool"][live_slots] = scatter["inter"][rows, accept - 1]
+            for path, ic in ((scatter, ic_s), (fused, ic_f)):
+                for conv_pool, window in zip(path["conv"], ic):
+                    conv_pool[live_slots] = window[rows, accept - 1]
+            # Fused commit: conv windows only, plus the accept length.
+            fused["accept"][live_slots] = accept.to(torch.int32)
+            committed = fused["inter"][live_slots, fused["accept"][live_slots] - 1]
+            self.assertTrue(
+                torch.equal(committed, scatter["pool"][live_slots]),
+                f"round {round_idx} committed state",
+            )
+            self.assertTrue(
+                torch.equal(fused["pool"], pool), "fused accept wrote the pool"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

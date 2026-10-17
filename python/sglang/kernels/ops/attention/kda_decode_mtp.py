@@ -5,6 +5,10 @@ L2 norm, beta sigmoid, ILP=2, W=4. Recurrent-state tiles are cp.async'd into
 NUM_STATE_STAGES smem stages. Phase 2 walks the V // TILE_V state tiles in
 passes of TILES_PER_PASS: a multi-token verify keeps them all register-resident
 across the token chain, a single-token step streams one at a time.
+
+Fused accept: given the per-slot accept lengths of the previous verify round,
+the kernel seeds each request from its accepted snapshot in intermediate_ssm
+instead of the committed pool, so the post-verify SSM commit scatter is skipped.
 """
 
 import cuda.bindings.driver as cuda
@@ -30,6 +34,8 @@ P1_V_WARP_DIVISOR = 4
 # where a deeper pipeline should have helped: the transfer is not the bottleneck
 # and the extra stage only costs smem.
 NUM_STATE_STAGES = 2
+# Multi-token verify instead stages four 32-row tiles; see _launch_config.
+NUM_STATE_STAGES_VERIFY = 4
 
 # Block size is chosen per launch, not fixed: below one wave (H*N <= SM count)
 # every SM gets one block regardless, so a wider block is free warps. Above it,
@@ -44,6 +50,7 @@ BLOCK_THREADS_WIDE = 512
 # repeated q/k/decay LDS sequence outweighs the one extra shuffle.
 P2_LANES_RESIDENT = 8
 P2_LANES_STREAM = 16
+P2_LANES_VERIFY = 16
 
 HEAD_DIM = TILE_K
 VEC_SIZE = HEAD_DIM // WARP_SIZE
@@ -59,15 +66,27 @@ def _stream_state(*, block_threads: int, num_spec: int) -> bool:
     return num_spec == 0 and block_threads == BLOCK_THREADS_NARROW
 
 
-def _p2_lanes(*, block_threads: int, num_spec: int) -> int:
-    return (
-        P2_LANES_STREAM
-        if _stream_state(block_threads=block_threads, num_spec=num_spec)
-        else P2_LANES_RESIDENT
-    )
+def _launch_config(
+    *, H: int, N: int, num_spec: int, cache_ring: bool
+) -> tuple[int, int, int]:
+    """(block threads, state stages, phase-2 lanes) for this grid.
+
+    Multi-token verify takes four 32-row state stages and a sixteen-lane K
+    split. Measured on B300 with H=12, cold L2: 37.3 -> 35.9 us at N=48 x 4
+    tokens, 17.0 -> 14.6 us at N=4 x 8 tokens. CACHE_RING keeps the resident
+    default, where eight lanes measured better.
+    """
+    block_threads = _block_threads(H=H, N=N)
+    if _stream_state(block_threads=block_threads, num_spec=num_spec):
+        return block_threads, NUM_STATE_STAGES, P2_LANES_STREAM
+    if num_spec > 0 and not cache_ring:
+        return block_threads, NUM_STATE_STAGES_VERIFY, P2_LANES_VERIFY
+    return block_threads, NUM_STATE_STAGES, P2_LANES_RESIDENT
 
 
-def _qk_smem(*, block_threads: int, num_spec: int) -> tuple[tuple[int, ...], int]:
+def _qk_smem(
+    *, block_threads: int, num_spec: int, p2_lanes: int
+) -> tuple[tuple[int, ...], int]:
     """Stride tuple and per-token element count for sQ/sK/sG.
 
     Both modes index the same (token, lane row, vector, element) shape; only the
@@ -77,7 +96,6 @@ def _qk_smem(*, block_threads: int, num_spec: int) -> tuple[tuple[int, ...], int
     k_grp + (jv * 4 + c) * P2_LANES_K, which is what the scalar path wants: no
     pad, and the same conflict-free access as an unpermuted [token, K] tile.
     """
-    p2_lanes = _p2_lanes(block_threads=block_threads, num_spec=num_spec)
     p2_vec = TILE_K // p2_lanes
     p2_qk_row = p2_vec + 4
     if _stream_state(block_threads=block_threads, num_spec=num_spec):
@@ -85,7 +103,9 @@ def _qk_smem(*, block_threads: int, num_spec: int) -> tuple[tuple[int, ...], int
     return (TILE_K, 1, 4 * p2_lanes, p2_lanes), TILE_K
 
 
-def _state_tile_v(*, block_threads: int, num_spec: int) -> int:
+def _state_tile_v(
+    *, block_threads: int, num_spec: int, p2_lanes: int, state_stages: int
+) -> int:
     """Height of the recurrent-state tile staged in smem, in value rows.
 
     Never below P2_ROWS_LANE rows per warp: a warp's P2_LANES_K-lane groups
@@ -95,19 +115,17 @@ def _state_tile_v(*, block_threads: int, num_spec: int) -> int:
     register-resident slice scale with the tile, and a consumer is waiting per
     tile, so a short tile pipelines. Residency wants the opposite: no token can
     start until every tile has landed, so there is nothing to overlap and the
-    best shape is the fewest, largest tiles that keep all NUM_STATE_STAGES in
+    best shape is the fewest, largest tiles that keep all state_stages in
     flight at once with no stage reuse.
     """
-    p2_rows_lane = WARP_SIZE // _p2_lanes(
-        block_threads=block_threads, num_spec=num_spec
-    )
+    p2_rows_lane = WARP_SIZE // p2_lanes
     min_rows = (block_threads // WARP_SIZE) * p2_rows_lane
     if _stream_state(block_threads=block_threads, num_spec=num_spec):
         # Sixteen rows doubles the stage waits and loses ~12% at B32. A 32-row
         # tile retains four phases while the sixteen-lane split still halves
         # the q/k/decay register arrays and LDS sequence.
         return max(min_rows, 32)
-    return max(min_rows, HEAD_DIM // NUM_STATE_STAGES)
+    return max(min_rows, HEAD_DIM // state_stages)
 
 
 def _issue_state_tile(
@@ -160,12 +178,15 @@ def kda_decode_mtp_kernel(
     smem_state_layout: cute.Layout,
     ssm_state_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
+    accept_lens: cute.Tensor,
     scale: cutlass.Constexpr[float],
     NUM_SPEC: cutlass.Constexpr[int],
     BLOCK_THREADS: cutlass.Constexpr[int],
     P2_LANES_K: cutlass.Constexpr[int],
+    NUM_STAGES: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
+    FUSED_ACCEPT: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
 ):
@@ -190,9 +211,14 @@ def kda_decode_mtp_kernel(
     V_CH_PER_THREAD = TILE_K // (P1_V_WARPS * WARP_SIZE)
     P2_ROWS_LANE = WARP_SIZE // P2_LANES_K
     P2_VEC = TILE_K // P2_LANES_K
-    TILE_V = _state_tile_v(block_threads=BLOCK_THREADS, num_spec=NUM_SPEC)
+    TILE_V = _state_tile_v(
+        block_threads=BLOCK_THREADS,
+        num_spec=NUM_SPEC,
+        p2_lanes=P2_LANES_K,
+        state_stages=NUM_STAGES,
+    )
     NUM_V_TILES = HEAD_DIM // TILE_V
-    STATE_STAGES = min(NUM_STATE_STAGES, NUM_V_TILES)
+    STATE_STAGES = min(NUM_STAGES, NUM_V_TILES)
     NUM_V_ROWS = TILE_V // NUM_WARPS
     P2_BATCHES = NUM_V_ROWS // P2_ROWS_LANE
     # How many state tiles phase 2 holds in registers at once. Holding all of
@@ -280,6 +306,9 @@ def kda_decode_mtp_kernel(
         # staged if (UNSUP_EARLY_EXIT).
         nvvm.exit()
 
+    # The int32 slot keeps the snapshot-store address math in the token loop
+    # 32-bit; intermediate_ssm compiles 32-bit strides only when its offsets fit.
+    slot_row = slot
     # int64: `slot * stride` overflows int32 on envelope-strided pools.
     slot = cutlass.Int64(slot)
 
@@ -319,7 +348,13 @@ def kda_decode_mtp_kernel(
                     r_wq[w * VEC_SIZE + i] = r_w4[w]
 
     # The 128-bit copy atom maps each thread to coalesced K vectors.
-    gState = h0[(slot, i_hv, None, None)]
+    if cutlass.const_expr(FUSED_ACCEPT):
+        # h0 is intermediate_ssm, rows keyed by slot. Rewriting its snapshots in
+        # place is race-free in any staging: a warp stores only the state rows
+        # its own cp.async loaded, after waiting on them (see state_g2s_copy).
+        gState = h0[(slot, accept_lens[slot] - 1, i_hv, None, None)]
+    else:
+        gState = h0[(slot, i_hv, None, None)]
     gStateTiles = cute.local_tile(gState, (TILE_V, TILE_K), (None, 0))
     thr_state_copy = state_g2s_copy.get_slice(tidx)
     for i_v in cutlass.range_constexpr(STATE_STAGES):
@@ -333,6 +368,9 @@ def kda_decode_mtp_kernel(
     eos = cu_seqlens[i_n + 1]
     n_tok = eos - bos
     scratch_row = intermediate_state_indices[i_n]
+    # Fused accept keys the SSM snapshots by slot so next round can seed from
+    # them; the conv windows stay on the per-batch scratch row.
+    ssm_row = slot_row if cutlass.const_expr(FUSED_ACCEPT) else scratch_row
     r_exp_A = cutlass.Float32(0.0)
 
     # Private weights remove the initial cross-warp dependency.
@@ -752,7 +790,7 @@ def kda_decode_mtp_kernel(
                         v_row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
                         for j in range(P2_VEC):
                             ht[
-                                scratch_row,
+                                ssm_row,
                                 i_t,
                                 i_hv,
                                 v_base + v_row,
@@ -814,30 +852,41 @@ def _run_kda_decode_mtp_dspark(
     ring_beta: cute.Tensor,
     onorm_g: cute.Tensor,
     onorm_weight: cute.Tensor,
+    accept_lens: cute.Tensor,
     scale: cutlass.Constexpr[float],
     H: cutlass.Constexpr[int],
     N: cutlass.Constexpr[int],
     NUM_SPEC: cutlass.Constexpr[int],
     BLOCK_THREADS: cutlass.Constexpr[int],
+    P2_LANES: cutlass.Constexpr[int],
+    NUM_STAGES: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
+    FUSED_ACCEPT: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     stream: cuda.CUstream,
 ):
     """Launch the fixed Kimi-K3/DSpARK bonus + NUM_SPEC-draft specialization."""
-    p2_lanes = _p2_lanes(block_threads=BLOCK_THREADS, num_spec=NUM_SPEC)
+    p2_lanes = P2_LANES
     p2_vec = TILE_K // p2_lanes
     # (token, lane row, vector, element within vector); see _qk_smem.
-    qk_stride, qk_elems = _qk_smem(block_threads=BLOCK_THREADS, num_spec=NUM_SPEC)
+    qk_stride, qk_elems = _qk_smem(
+        block_threads=BLOCK_THREADS, num_spec=NUM_SPEC, p2_lanes=p2_lanes
+    )
     smem_qk_layout = cute.make_layout(
         (1 + NUM_SPEC, p2_lanes, p2_vec // 4, 4), stride=qk_stride
     )
     # Padding by the subgroup width shifts concurrent v-rows onto disjoint bank
     # groups: +8 tiles four eight-bank windows; +16 tiles two half-warps.
     smem_state_stride = TILE_K + p2_lanes
-    TILE_V = _state_tile_v(block_threads=BLOCK_THREADS, num_spec=NUM_SPEC)
-    state_stages = min(NUM_STATE_STAGES, TILE_K // TILE_V)
+    TILE_V = _state_tile_v(
+        block_threads=BLOCK_THREADS,
+        num_spec=NUM_SPEC,
+        p2_lanes=p2_lanes,
+        state_stages=NUM_STAGES,
+    )
+    state_stages = min(NUM_STAGES, TILE_K // TILE_V)
     state_stage_elems = TILE_V * smem_state_stride
     state_smem_elems = state_stages * state_stage_elems
     smem_state_layout = cute.make_layout(
@@ -854,6 +903,9 @@ def _run_kda_decode_mtp_dspark(
         cutlass.Float32,
         num_bits_per_copy=128,
     )
+    # Each state row's copy threads sit in the warp that consumes the row, which
+    # the post-load sync_warp and fused accept's in-place snapshots rely on.
+    assert WARP_SIZE % (BLOCK_THREADS // TILE_V) == 0
     state_g2s_copy = cute.make_tiled_copy_tv(
         state_copy_atom,
         thr_layout=cute.make_layout(
@@ -904,12 +956,15 @@ def _run_kda_decode_mtp_dspark(
         smem_state_layout,
         ssm_state_indices,
         cu_seqlens,
+        accept_lens,
         scale,
         NUM_SPEC,
         BLOCK_THREADS,
         p2_lanes,
+        NUM_STAGES,
         lower_bound,
         CACHE_RING,
+        FUSED_ACCEPT,
         APPLY_ONORM,
         onorm_eps,
     ).launch(
@@ -1022,6 +1077,7 @@ def fused_kda_decode_mtp_dspark(
     onorm_gate=None,
     onorm_weight=None,
     onorm_eps=None,
+    accept_lens_pool=None,
 ):
     """Run Kimi-K3 KDA verify while preserving DSpARK rollback semantics.
 
@@ -1039,6 +1095,14 @@ def fused_kda_decode_mtp_dspark(
 
     Passing all three onorm_* arguments fuses gated RMSNorm into the recurrence
     kernel.
+
+    Fused accept: passing accept_lens_pool ([slots] int32, last round's accept
+    length per mamba slot, >= 1) seeds request n from
+    intermediate_ssm[slot, accept_lens_pool[slot] - 1] instead of
+    recurrent_state[slot], and writes its snapshots to intermediate_ssm[slot, :]
+    in place, so intermediate_ssm needs a row per mamba slot. recurrent_state is
+    then not read and the caller skips the post-verify SSM commit; conv windows
+    keep the intermediate_state_indices rows.
     """
     import torch
 
@@ -1112,6 +1176,13 @@ def fused_kda_decode_mtp_dspark(
             f"expected intermediate SSM layout [scratch, >={1 + num_spec}, H, "
             f"V=128, K=128]"
         )
+    fused_accept = accept_lens_pool is not None
+    if fused_accept and (cache_ring or num_spec == 0):
+        raise ValueError("fused accept needs intermediate_ssm and num_spec > 0")
+    if fused_accept and (
+        accept_lens_pool.dtype != torch.int32 or accept_lens_pool.dim() != 1
+    ):
+        raise ValueError("accept_lens_pool must be a 1-D int32 per-slot tensor")
     if scale is None:
         scale = TILE_K**-0.5
     onorm_args = (onorm_gate, onorm_weight, onorm_eps)
@@ -1127,10 +1198,12 @@ def fused_kda_decode_mtp_dspark(
             raise ValueError(f"expected output-norm weight shape {(TILE_K,)}")
         if onorm_gate.dtype != torch.bfloat16 or onorm_weight.dtype != torch.float32:
             raise ValueError("expected output-norm gate=bf16 and weight=fp32")
-    block_threads = _block_threads(H=H, N=N)
+    block_threads, num_stages, p2_lanes = _launch_config(
+        H=H, N=N, num_spec=num_spec, cache_ring=cache_ring
+    )
     out = torch.empty_like(x_v)
     args = (
-        recurrent_state,
+        intermediate_ssm if fused_accept else recurrent_state,
         x_q,
         x_k,
         x_v,
@@ -1159,6 +1232,8 @@ def fused_kda_decode_mtp_dspark(
         replayssm_beta if cache_ring else intermediate_conv_q[..., 0],
         onorm_gate if apply_onorm else x_v,
         onorm_weight if apply_onorm else dt_bias,
+        # Compile-time-dead placeholder when fused accept is off.
+        accept_lens_pool if fused_accept else ssm_state_indices,
     )
     fits_32bit = tuple(_fits_32bit_stride(tensor) for tensor in args)
     key = (
@@ -1167,7 +1242,10 @@ def fused_kda_decode_mtp_dspark(
         N,
         num_spec,
         block_threads,
+        num_stages,
+        p2_lanes,
         cache_ring,
+        fused_accept,
         apply_onorm,
         float(onorm_eps) if apply_onorm else 0.0,
         float(scale),
@@ -1189,8 +1267,11 @@ def fused_kda_decode_mtp_dspark(
             N=N,
             NUM_SPEC=num_spec,
             BLOCK_THREADS=block_threads,
+            P2_LANES=p2_lanes,
+            NUM_STAGES=num_stages,
             lower_bound=float(lower_bound),
             CACHE_RING=cache_ring,
+            FUSED_ACCEPT=fused_accept,
             APPLY_ONORM=apply_onorm,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
             stream=stream,

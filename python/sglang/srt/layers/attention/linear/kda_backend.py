@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
     mamba_cache_chunk_size,
+    max_speculative_num_draft_tokens,
 )
 
 
@@ -94,6 +95,20 @@ def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     ):
         return "flashinfer"
     return None
+
+
+# draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
+# specialized per block size and capped at 8 by shared-memory growth.
+_DSPARK_CUTEDSL_DRAFT_TOKENS = range(2, 9)
+
+
+def _dspark_cutedsl_available() -> bool:
+    """Whether the nv_cutedsl verify kernel can run on this device at all."""
+    return (
+        is_cuda()
+        and importlib.util.find_spec("cutlass") is not None
+        and torch.cuda.get_device_capability()[0] == 10
+    )
 
 
 class KDAKernelDispatcher:
@@ -538,9 +553,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
-        # Fused-accept spec path (flashinfer recurrent_kda): the next verify
-        # seeds itself in-kernel from the accepted checkpoint slot
-        # (num_accepted_tokens), so the per-round SSM commit scatter is skipped.
+        # Fused-accept spec path (flashinfer recurrent_kda, nv_cutedsl): the next
+        # verify seeds itself in-kernel from the accepted checkpoint slot, so
+        # the per-round SSM commit scatter is skipped.
         # accept_lens_pool holds last round's accept length per mamba slot;
         # extend stages fresh requests with 1 (read slot 0). Its presence is the
         # signal that switches the post-verify commit to conv-only.
@@ -555,22 +570,45 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def _can_fuse_accept_state(verify_backend) -> bool:
         """Whether the verify kernel can seed itself from the accepted checkpoint.
 
-        The seed comes from recurrent_kda's ``num_accepted_tokens``, which makes
-        the previous round's accepted state addressable in-kernel so the SSM
-        state never has to round-trip through the committed pool (`temporal`).
-        Hence the keying on the verify backend -- the one that selects the
-        target_verify kernel -- and not on decode, which is set separately.
+        The seed comes from recurrent_kda's ``num_accepted_tokens`` or the
+        nv_cutedsl kernel's ``accept_lens_pool``, which make the previous round's
+        accepted state addressable in-kernel so the SSM state never has to
+        round-trip through the committed pool (`temporal`). Hence the keying on
+        the verify backend -- the one that selects the target_verify kernel --
+        and not on decode, which is set separately. nv_cutedsl's Triton fallback
+        cannot seed from the scratch, so nv_cutedsl qualifies only when every
+        init-static input of its CuTe contract holds; the per-layer shape rules
+        are left to `_forward_target_verify`, which raises if one fails.
 
         `temporal` then goes stale between verifies, which is what the remaining
         conditions rule out: each is a reader of the committed state that the
-        skipped scatter would starve. Falling short of the contract falls back to
-        the commit scatter rather than raising -- this is a capability, not a
-        mode. Every condition reads its namespace bag rather than the record:
-        these are fields resolution decides, so the record would answer with
-        what the operator typed instead of what was decided.
+        skipped scatter would starve. Falling short of these conditions keeps the
+        commit scatter -- this is a capability, not a mode. Every condition reads
+        its namespace bag rather than the record: these are fields resolution
+        decides, so the record would answer with what the operator typed instead
+        of what was decided.
         """
-        if not verify_backend.is_flashinfer():
-            return False  # only recurrent_kda takes num_accepted_tokens
+        if verify_backend.is_nv_cutedsl():
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if not _dspark_cutedsl_available():
+                return False  # the Triton fallback cannot seed from scratch
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                return False  # ragged layouts take the Triton fallback
+            if (get_spec().speculative_eagle_topk or 1) > 1:
+                return False  # so does tree verify (retrieve_parent_token)
+            if (
+                get_spec().speculative_num_draft_tokens
+                not in _DSPARK_CUTEDSL_DRAFT_TOKENS
+                or max_speculative_num_draft_tokens()
+                not in _DSPARK_CUTEDSL_DRAFT_TOKENS
+            ):
+                return False  # and any draft window the kernel is not built for
+        elif not verify_backend.is_flashinfer():
+            return False  # the other verify kernels always seed from `temporal`
         if get_spec().speculative_algorithm is None:
             return False  # no verify round, and no intermediate scratch
         if not get_memory().disable_radix_cache:
@@ -1292,6 +1330,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_rawk=mamba_cache_params.replayssm_rawk,
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
+                accept_lens_pool=self.accept_lens_pool,
+            )
+        if (
+            self.accept_lens_pool is not None
+            and self.kernel_dispatcher.verify_backend.is_nv_cutedsl()
+        ):
+            # The Triton fallback seeds from `temporal`, which fused accept
+            # leaves stale; there is no per-layer way back to the commit scatter.
+            raise RuntimeError(
+                "KDA fused-accept verify (nv_cutedsl, radix cache disabled) needs "
+                f"the Kimi-K3 CuTe verify contract, which layer {layer.layer_id} "
+                "does not meet (128-dim heads, no conv bias, a gate lower bound, "
+                "bf16 inputs); use --linear-attn-verify-backend triton or enable "
+                "the radix cache."
             )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
@@ -1710,17 +1762,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawv: Optional[torch.Tensor],
     ) -> bool:
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
-        if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
+        if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl():
             return False
-        if importlib.util.find_spec("cutlass") is None:
-            return False
-        if torch.cuda.get_device_capability()[0] != 10:
+        if not _dspark_cutedsl_available():
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
-        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
-        # specialized per block size and capped at 8 by shared-memory growth.
-        if not 2 <= draft_token_num <= 8:
+        if draft_token_num not in _DSPARK_CUTEDSL_DRAFT_TOKENS:
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
@@ -1797,6 +1845,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
+        accept_lens_pool: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
@@ -1869,6 +1918,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_gate=onorm_gate,
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
+            accept_lens_pool=accept_lens_pool,
         )
         if apply_onorm:
             layer._k3_onorm_consumed = True
