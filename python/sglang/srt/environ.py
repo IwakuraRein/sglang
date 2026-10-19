@@ -1159,6 +1159,9 @@ class Envs:
     # trtllm-gen. Measured on B300 (12 heads, q_len 4, 8K context, bf16 KV):
     # trtllm-gen 288 us, cute-dsl 115 us; at q_len 1 trtllm-gen 89, cute-dsl 105.
     SGLANG_TRTLLM_MLA_VERIFY_BACKEND = EnvStr("trtllm-gen")
+    # Force tokenspeed_mla's MLA decode/verify kernel: "tokenspeed" or "cute-dsl".
+    # Unset picks per shape (heuristic in tokenspeed_mla_backend.py).
+    SGLANG_FORCE_TOKENSPEED_MLA_DECODE_KERNEL = EnvStr(None)
     # Split TRTLLM-GEN decode attention into sorted, equal-size request groups.
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.

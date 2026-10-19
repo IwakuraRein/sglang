@@ -44,9 +44,11 @@ from sglang.kernels.ops.attention.utils import (
     mla_quantize_without_rope_for_fp8,
 )
 from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
+    _cute_dsl_workspace_buffer,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
@@ -59,6 +61,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
 if is_flashinfer_available():
+    import flashinfer.decode as _flashinfer_decode
     import flashinfer.rope as _flashinfer_rope
 
 if is_tokenspeed_mla_available():
@@ -106,6 +109,87 @@ def _get_tokenspeed_workspace(
     return buffers[key]
 
 
+# Decode/verify shapes where FlashInfer's cute-dsl MLA kernel beat tokenspeed_mla_decode
+# on B300 with an fp8 KV cache (kv_lora 512, rope 64, page 64): 12 query heads (TP8) and
+# 96 (TP8 + DCP8, gathered Q), 1/2/4/8 query tokens, 1-128 requests, over 4k-768k
+# contexts. A CUDA graph cannot see context lengths, so the choice keys on these shapes.
+# Measured with
+# test/manual/kernels/benchmark/attention/bench_mla_verify_cutedsl_vs_tokenspeed.py.
+_CUTE_DSL_DECODE_HEADS = frozenset({12, 96})
+_CUTE_DSL_DECODE_Q_LENS = frozenset({1, 2, 4, 8})
+_CUTE_DSL_DECODE_MAX_REQS = 128
+_CUTE_DSL_DECODE_PAGE_SIZE = 64
+_DECODE_KERNELS = ("tokenspeed", "cute-dsl")
+
+
+def _select_decode_kernel(
+    *, forced: Optional[str], static_shape_ok: bool, q_len: int, num_reqs: int
+) -> str:
+    """The MLA decode kernel tokenspeed_mla runs: "cute-dsl" or "tokenspeed"."""
+    if forced is not None:
+        return forced
+    if (
+        static_shape_ok
+        and q_len in _CUTE_DSL_DECODE_Q_LENS
+        and num_reqs <= _CUTE_DSL_DECODE_MAX_REQS
+    ):
+        return "cute-dsl"
+    return "tokenspeed"
+
+
+def _cute_dsl_mla_decode(
+    *,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    softmax_scale: float,
+    output_scale: float,
+    causal_seqs: Optional[torch.Tensor] = None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    return_lse: bool = False,
+):
+    """FlashInfer cute-dsl MLA decode with tokenspeed_mla_decode's conventions,
+    including the base-2 log-sum-exp the tokenspeed_mla DCP merge reads."""
+    dcp = {}
+    if cp_world > 1:
+        dcp = dict(
+            enable_dcp=True,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+            causal_seqlens_kv_global=(
+                causal_seqs
+                if causal_seqs.dtype == torch.int32
+                else causal_seqs.to(torch.int32)
+            ),
+        )
+    return _flashinfer_decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        bmm1_scale=softmax_scale,
+        bmm2_scale=output_scale,
+        backend="cute-dsl",
+        enable_pdl=is_arch_support_pdl(),
+        return_lse=return_lse,
+        # cute-dsl defaults to natural log.
+        return_lse_base="base2",
+        **dcp,
+    )
+
+
 # TODO(Qiaolin-Yu): Merge this attention backend into trtllm_mla_backend.py
 # once the same CuteDSL kernels in flashinfer_trtllm are stable
 # and there is no performance gap compared to this backend.
@@ -135,6 +219,25 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             raise ValueError(
                 "tokenspeed_mla backend requires page_size in {32, 64}, "
                 f"got page_size={self.page_size}."
+            )
+
+        self.forced_decode_kernel = envs.SGLANG_FORCE_TOKENSPEED_MLA_DECODE_KERNEL.get()
+        if self.forced_decode_kernel not in (None, *_DECODE_KERNELS):
+            raise ValueError(
+                "SGLANG_FORCE_TOKENSPEED_MLA_DECODE_KERNEL must be one of "
+                f"{_DECODE_KERNELS}, got {self.forced_decode_kernel!r}"
+            )
+        # Every decode/verify query carries num_decode_q_heads heads.
+        self.cute_dsl_decode_static_shape_ok = (
+            self.page_size == _CUTE_DSL_DECODE_PAGE_SIZE
+            and self.num_decode_q_heads in _CUTE_DSL_DECODE_HEADS
+        )
+        self._cute_dsl_workspace: Optional[torch.Tensor] = None
+        if self.forced_decode_kernel == "cute-dsl" or (
+            self.forced_decode_kernel is None and self.cute_dsl_decode_static_shape_ok
+        ):
+            self._cute_dsl_workspace = _cute_dsl_workspace_buffer(
+                size=self.workspace_size, device=model_runner.device
             )
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
@@ -332,6 +435,30 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        kernel = _select_decode_kernel(
+            forced=self.forced_decode_kernel,
+            static_shape_ok=self.cute_dsl_decode_static_shape_ok,
+            q_len=query.shape[1] if query.dim() == 4 else 1,
+            num_reqs=query.shape[0],
+        )
+        if kernel == "cute-dsl":
+            return _cute_dsl_mla_decode(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=self._cute_dsl_workspace,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens_i32,
+                max_seq_len=int(max_seq_len),
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
+                causal_seqs=causal_seqs,
+                cp_world=cp_world,
+                cp_rank=cp_rank,
+                return_lse=return_lse,
+            )
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
